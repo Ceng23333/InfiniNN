@@ -3,8 +3,8 @@
     macros::*,
 };
 use crate::{
-    TPAction,
-    weight_types::{AttnQKV, RowTPWeight},
+    Arg, TPAction,
+    weight_types::{AttnQKV, ColumnTPWeight, RowTPWeight},
 };
 use tensor::digit_layout::types;
 
@@ -12,11 +12,21 @@ use tensor::digit_layout::types;
 pub struct Attention<T> {
     pub nh: usize,
     pub nkvh: usize,
-    pub qkv: Linear<T>,
+    pub qkv: QKVFormat<T>,
     pub q_norm: Option<Normalization<T>>,
     pub k_norm: Option<Normalization<T>>,
     pub rope: Option<RoPE<T>>,
     pub output: Linear<T>,
+}
+
+#[derive(Clone)]
+pub enum QKVFormat<T> {
+    Combined(Linear<T>),
+    Separated {
+        q: Linear<T>,
+        k: Linear<T>,
+        v: Linear<T>,
+    },
 }
 
 #[derive(Clone)]
@@ -43,7 +53,16 @@ impl<T> Attention<T> {
         Attention {
             nh: nh / dist.total * dist.len,
             nkvh: nkvh / dist.total * dist.len,
-            qkv: qkv.parallel(TPAction::new(AttnQKV(nh / nkvh), dist)),
+            qkv: match qkv {
+                QKVFormat::Combined(qkv) => {
+                    QKVFormat::Combined(qkv.parallel(TPAction::new(AttnQKV(nh / nkvh), dist)))
+                }
+                QKVFormat::Separated { q, k, v } => QKVFormat::Separated {
+                    q: q.parallel(TPAction::new(ColumnTPWeight, dist)),
+                    k: k.parallel(TPAction::new(ColumnTPWeight, dist)),
+                    v: v.parallel(TPAction::new(ColumnTPWeight, dist)),
+                },
+            },
             q_norm: q_norm.map(|norm| norm.tensor_parallel()),
             k_norm: k_norm.map(|norm| norm.tensor_parallel()),
             rope: rope.map(
@@ -81,12 +100,36 @@ impl<T> NuralNetwork<T> for Attention<T> {
             rope,
             output,
         } = self;
-        destruct!([x] = ctx.trap("attn-qkv", qkv, [x])?);
-        dims!([_, dqkv] = x);
-        let dh = dqkv.clone() / (nh + nkvh + nkvh);
 
-        destruct!([q, k, v] = x.split("split-qkv", 1, [nh.into(), nkvh.into(), nkvh.into()])?);
+        dims!([_, d] = x);
+        let dh = d.clone() / nh;
 
+        let [q, k, v] = match qkv {
+            QKVFormat::Combined(qkv) => {
+                destruct!([x] = ctx.trap("attn-qkv", qkv, [x])?);
+                destruct!(
+                    [q, k, v] = ctx.call(
+                        "split-qkv",
+                        "split",
+                        Some(Arg::dict([
+                            ("axis".into(), Arg::int(1)),
+                            (
+                                "parts".into(),
+                                Arg::arr([Arg::dim(nh), Arg::dim(nkvh), Arg::dim(nkvh)])
+                            )
+                        ])),
+                        [x],
+                    )?
+                );
+                [q, k, v]
+            }
+            QKVFormat::Separated { q, k, v } => {
+                destruct!([q] = ctx.trap("attn-q", q, [x.clone()])?);
+                destruct!([k] = ctx.trap("attn-k", k, [x.clone()])?);
+                destruct!([v] = ctx.trap("attn-v", v, [x])?);
+                [q, k, v]
+            }
+        };
         // Apply normalization to q and k if they exist
         let q = match q_norm {
             Some(norm) => {
@@ -120,7 +163,6 @@ impl<T> NuralNetwork<T> for Attention<T> {
                 };
                 let sin = ctx.load_external("rope.sin", types::F32, shape.clone(), sin);
                 let cos = ctx.load_external("rope.cos", types::F32, shape, cos);
-
                 let op = if multimodal { "mrope" } else { "rope" };
                 destruct!(
                     [q_] = ctx.call(

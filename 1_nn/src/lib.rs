@@ -40,7 +40,7 @@ impl<T> NNGraph<T> {
                 *arg = std::mem::replace(arg, Arg::Bool(false)).substitute(value)
             }
         }
-        let edges = edges.into_iter().map(|e| {
+        let edges = edges.into_iter().flat_map(|e| {
             let Edge { meta, external } = e;
             let shape = meta
                 .shape
@@ -51,10 +51,17 @@ impl<T> NNGraph<T> {
                 Some(External { name, item }) => {
                     let tensor = map(item);
                     assert_eq!(tensor.dt(), meta.dt(), "data type mismatch: {name}");
+
                     assert_eq!(tensor.shape(), shape, "shape mismatch: {name}");
-                    tensor.map(|item| mem::Info::External(External { name, item }))
+                    let dt = tensor.dt().to_string();
+                    match dt.as_str() {
+                        "f32" => {
+                            vec![tensor.map(|item| mem::Info::External(External { name, item }))]
+                        }
+                        _ => vec![tensor.map(|item| mem::Info::External(External { name, item }))],
+                    }
                 }
-                None => Tensor::from_dim_slice(meta.dt, &shape).map(mem::Info::Internal),
+                None => vec![Tensor::from_dim_slice(meta.dt, &shape).map(mem::Info::Internal)],
             }
         });
         mem::Graph::new(topo, nodes, edges)
